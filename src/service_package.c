@@ -142,7 +142,22 @@ socket_message(struct skynet_context *ctx, struct package *P, const struct skyne
 	case SKYNET_SOCKET_TYPE_CONNECT:
 		if(P->init == 0 && smsg->id == P->fd) {
 			skynet_send(ctx,0,P->manager,PTYPE_TEXT,0,"SUCC",4);		
+			P->init= 1;
 		}
+		break;
+	case SKYNET_SOCKET_TYPE_CLOSE:
+	case SKYNET_SOCKET_TYPE_ERROR:
+		if(P->init == 0 && smsg->id == P->fd) {
+			skynet_send(ctx,0,P->manager,PTYPE_TEXT,0,"FAIL",4);
+			P->init = 1;
+		}
+		if(smsg->id != P->fd) {
+			skynet_error(ctx,"Invalid fd (%d), should be (%d)",smsg->id,P->fd);
+		} else {
+			response(ctx,P);
+			service_exit(ctx,P);
+		}
+		break;
 	}
 }
 
