@@ -10,4 +10,8 @@ skynet.start(function()
 		"c2s",
 		"s2c",
 	})
+
+	local hub = skynet.uniqueservice "hub"
+	skynet.call(hub,"lua","open","0.0.0.0",5678)
+	skynet.exit()
 end)

@@ -113,6 +113,23 @@ queue_size(struct queue *q) {
 }
 
 static void
+service_exit(struct skynet_context *ctx, struct package *P) {
+	P->closed = 1;
+	while(!queue_empty(&P->request)) {
+		struct request req;
+		queue_pop(&P->request,&req);
+		skynet_send(ctx,0,req.source,PTYPE_ERROR,req.session,NULL,0);
+	}
+	while(!queue_empty(&P->response)) {
+		struct response resp;
+		queue_pop(&P->response,&resp);
+		skynet_free(resp.msg);
+	}
+	skynet_send(ctx,0,P->manager,PTYPE_TEXT,0,"CLOSED",6);
+	skynet_command(ctx,"EXIT",NULL);
+}
+
+static void
 command(struct skynet_context *ctx, struct package *P, int session, uint32_t source, const char *msg, size_t sz) {
 	switch (msg[0]) {
 	case 'R':
@@ -121,18 +138,77 @@ command(struct skynet_context *ctx, struct package *P, int session, uint32_t sou
 			skynet_send(ctx,0,source,PTYPE_ERROR,session,NULL,0);
 			break;
 		}
+		printf("before read\n");
 		if(!queue_empty(&P->response)) {
 			assert(queue_empty(&P->request));
 			struct response resp;
 			queue_pop(&P->response, &resp);
 			skynet_send(ctx,0,source,PTYPE_RESPONSE | PTYPE_TAG_DONTCOPY, session, resp.msg, resp.sz);
+			printf("2222\n");
 		} else {
+			printf("11111\n");
 			struct request req;
 			req.source = source;
 			req.session = session;
 			queue_push(&P->request , &req);
 		}
 		break;
+	}
+}
+
+static void
+new_message(struct package *P, const uint8_t *msg, int sz) {
+	++P->recv;
+	for(;;) {
+		if (P->uncomplete_sz >= 0) {
+			if (sz >= P->uncomplete_sz) {
+				memcpy(P->uncomplete.msg + P->uncomplete.sz - P->uncomplete_sz, msg, P->uncomplete_sz);
+				msg += P->uncomplete_sz;
+				sz -= P->uncomplete_sz;
+				queue_push(&P->response, &P->uncomplete);
+				P->uncomplete_sz = -1;
+			} else {
+				memcpy(P->uncomplete.msg + P->uncomplete.sz - P->uncomplete_sz, msg, sz);
+				P->uncomplete_sz -= sz;
+				return;
+			}
+		}
+		if (sz <= 0)
+			return;
+		if (P->header_sz == 0) {
+			if (sz == 1) {
+				P->header[0] = msg[0];
+				P->header_sz = 1;
+				return;
+			}
+			P->header[0] = msg[0];
+			P->header[1] = msg[1];
+			msg += 2;
+			sz -= 2;
+		} else {
+			assert(P->header_sz == 1);
+			P->header[1] = msg[0];
+			P->header_sz = 0;
+			++msg;
+			--sz;
+		}
+		P->uncomplete.sz = P->header[0] * 256 + P->header[1];
+		P->uncomplete.msg = skynet_malloc(P->uncomplete.sz);
+		P->uncomplete_sz = P->uncomplete.sz;
+	}
+}
+
+static void
+response(struct skynet_context *ctx, struct package *P) {
+	while(!queue_empty(&P->request)) {
+		if(queue_empty(&P->response)) {
+			break;
+		}
+		struct request req;
+		struct response resp;
+		queue_pop(&P->request, &req);
+		queue_pop(&P->response, &resp);
+		skynet_send(ctx,0,req.source,PTYPE_RESPONSE | PTYPE_TAG_DONTCOPY, req.session, resp.msg, resp.sz);
 	}
 }
 
@@ -158,7 +234,38 @@ socket_message(struct skynet_context *ctx, struct package *P, const struct skyne
 			service_exit(ctx,P);
 		}
 		break;
+	case SKYNET_SOCKET_TYPE_DATA:
+		new_message(P,(const uint8_t*)smsg->buffer,smsg->ud);
+		skynet_free(smsg->buffer);
+		response(ctx,P);
+		break;
 	}
+}
+
+static void
+heartbeat(struct skynet_context *ctx, struct package *P) {
+	if(P->recv == P->heartbeat) {
+		if(!P->closed) {
+			skynet_socket_shutdown(ctx,P->fd);
+			skynet_error(ctx,"timeout %d",P->fd);
+		}
+	} else {
+		P->heartbeat = P->recv = 0;
+		skynet_command(ctx,"TIMEOUT",TIMEOUT);
+	}
+}
+
+static void
+send_out(struct skynet_context *ctx, struct package *P, const void *msg , size_t sz) {
+	if(sz > 0xffff) {
+		skynet_error(ctx,"package too long (%08x)",(uint32_t)sz);
+		return;
+	}
+	uint8_t * p = skynet_malloc(sz + 2);
+	p[0] = (sz & 0xff00) >> 8;
+	p[1] = sz & 0xff;
+	memcpy(p + 2, msg, sz);
+	skynet_socket_send(ctx, P->fd, p, sz + 2);
 }
 
 static int
@@ -168,16 +275,31 @@ message_handler(struct skynet_context * ctx, void *ud, int type, int session, ui
 	case PTYPE_TEXT:
 		command(ctx,P,session, source, msg, sz);
 		break;
+	case PTYPE_CLIENT:
+		send_out(ctx,P,msg,sz);
+		break;
+	case PTYPE_RESPONSE:
+		heartbeat(ctx,P);
+		break;
 	case PTYPE_SOCKET:
 		socket_message(ctx,P,msg);
 		break;
+	case PTYPE_ERROR:
+		break;
+	default:
+		if(session > 0) {
+			skynet_send(ctx,0,source,PTYPE_ERROR,session,NULL,0);
+		}
+		break;
 	}
+	return 0;
 }
 
 
 /// service 的几个函数
 struct package *
 package_create(void) {
+	printf("package_create\n");
 	struct package * P = skynet_malloc(sizeof(*P));
 	memset(P,0,sizeof(*P));
 	P->heartbeat = -1;
@@ -197,6 +319,7 @@ package_release(struct package *P) {
 int
 package_init(struct package * P, struct skynet_context *ctx, const char * param) {
 	int n = sscanf(param ? param : "", "%u %d", &P->manager, &P->fd);
+	printf("package_init %d %u %d\n", n , &P->manager, &P->fd);
 	if(n != 2 || P->manager == 0 || P->fd == 0) {
 		skynet_error(ctx,"Invalid param [%d]",param);
 		return 1;

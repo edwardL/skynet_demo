@@ -55,6 +55,7 @@ skynet.start(function()
 		if cmd == "CLOSED" then
 			close_agent(source)
 		elseif cmd == "SUCC" then
+			print("recv succ text")
 			socket_init[source](true,source)
 			socket_init[source] = nil
 		elseif cmd == "FAIL" then
@@ -64,7 +65,7 @@ skynet.start(function()
 			skynet.error("Invalid command " .. cmd)
 		end
 	end)
-	skynet.dispatch("lua",function(session,source,fd))
+	skynet.dispatch("lua",function(session,source,fd)
 		assert(type(fd) == "number")
 		local addr = subscribe(fd)
 		if addr then

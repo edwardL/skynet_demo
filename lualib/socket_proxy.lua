@@ -48,7 +48,7 @@ function proxy.write(fd,msg,sz)
 	skynet.send(get_addr(fd),"client",msg,sz)
 end
 
-function proxys.close(fd)
+function proxy.close(fd)
 	skynet.send(get_addr(fd),"text","K")
 end
 
